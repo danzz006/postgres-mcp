@@ -1,0 +1,47 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Remove running instantances",
+            "type": "shell",
+            "command": "docker rm -f pgmcp; docker rmi -f postgres-mcp:${input:imageTag}"
+        },
+        {
+            "label": "Build docker image",
+            "type": "shell",
+            "command": "docker build -t danzz0024511/postgres-mcp:${input:imageTag} ."
+        },
+        {
+            "label": "Run container",
+            "type": "shell",
+            "command": "docker run -d -p 8000:8000 --name pgmcp --hostname postgres-mcp -e DATABASE_URI=postgresql://postgres:post123@172.17.0.4:5432/datawarehouse danzz0024511/postgres-mcp:${input:imageTag} --access-mode=unrestricted --transport=streamable-http --streamable-http-host=0.0.0.0"
+        },
+        {
+            "label": "Push image",
+            "type": "shell",
+            "command": "docker push danzz0024511/postgres-mcp:${input:imageTag}"
+        },
+        {
+            "label": "Build",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Remove running instantances",
+                "Build docker image",
+                "Run container"
+            ],
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "imageTag",
+            "description": "Enter the Docker image tag:",
+            "default": "custom-0.0.2",
+            "type": "promptString"
+        }
+    ]
+}

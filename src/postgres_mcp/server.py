@@ -14,11 +14,11 @@ from typing import Union
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from pydantic import validate_call
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
-
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
@@ -35,7 +35,10 @@ from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
 
 # Initialize FastMCP with default settings
-mcp = FastMCP("postgres-mcp")
+mcp = FastMCP(
+    "postgres-mcp",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+)
 
 # Constants
 PG_STAT_STATEMENTS = "pg_stat_statements"
@@ -82,249 +85,100 @@ def format_error_response(error: str) -> ResponseType:
 
 
 @mcp.tool(
-    description="List all schemas in the database",
+    description="List all available tables in the database",
     annotations=ToolAnnotations(
-        title="List Schemas",
+        title="List tables",
         readOnlyHint=True,
     ),
 )
-async def list_schemas() -> ResponseType:
-    """List all schemas in the database."""
+async def list_tables() -> ResponseType:
+    """List all available tables in the database."""
     try:
         sql_driver = await get_sql_driver()
         rows = await sql_driver.execute_query(
             """
             SELECT
-                schema_name,
-                schema_owner,
-                CASE
-                    WHEN schema_name LIKE 'pg_%' THEN 'System Schema'
-                    WHEN schema_name = 'information_schema' THEN 'System Information Schema'
-                    ELSE 'User Schema'
-                END as schema_type
-            FROM information_schema.schemata
-            ORDER BY schema_type, schema_name
+                t.table_schema,
+                t.table_name
+            FROM information_schema.tables t
+            WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY t.table_schema, t.table_name
             """
         )
-        schemas = [row.cells for row in rows] if rows else []
-        return format_text_response(schemas)
+        
+        # Create list of tables
+        tables_list = []
+        if rows:
+            for row in rows:
+                tables_list.append({
+                    "schema": row.cells["table_schema"],
+                    "table": row.cells["table_name"]
+                })
+        
+        return format_text_response(tables_list)
     except Exception as e:
-        logger.error(f"Error listing schemas: {e}")
+        logger.error(f"Error listing tables: {e}")
         return format_error_response(str(e))
 
 
 @mcp.tool(
-    description="List objects in a schema",
+    description="Get the schema and column structure of a specific table",
     annotations=ToolAnnotations(
-        title="List Objects",
+        title="Get Table Schema",
         readOnlyHint=True,
     ),
 )
-async def list_objects(
-    schema_name: str = Field(description="Schema name"),
-    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+async def get_table_schema(
+    table: str = Field(description="Table name (optionally schema-qualified, e.g., 'public.users' or 'users')"),
 ) -> ResponseType:
-    """List objects of a given type in a schema."""
+    """Get the schema and column structure of a specific table."""
     try:
         sql_driver = await get_sql_driver()
-
-        if object_type in ("table", "view"):
-            table_type = "BASE TABLE" if object_type == "table" else "VIEW"
-            rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT table_schema, table_name, table_type
-                FROM information_schema.tables
-                WHERE table_schema = {} AND table_type = {}
-                ORDER BY table_name
-                """,
-                [schema_name, table_type],
-            )
-            objects = (
-                [{"schema": row.cells["table_schema"], "name": row.cells["table_name"], "type": row.cells["table_type"]} for row in rows]
-                if rows
-                else []
-            )
-
-        elif object_type == "sequence":
-            rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT sequence_schema, sequence_name, data_type
-                FROM information_schema.sequences
-                WHERE sequence_schema = {}
-                ORDER BY sequence_name
-                """,
-                [schema_name],
-            )
-            objects = (
-                [{"schema": row.cells["sequence_schema"], "name": row.cells["sequence_name"], "data_type": row.cells["data_type"]} for row in rows]
-                if rows
-                else []
-            )
-
-        elif object_type == "extension":
-            # Extensions are not schema-specific
-            rows = await sql_driver.execute_query(
-                """
-                SELECT extname, extversion, extrelocatable
-                FROM pg_extension
-                ORDER BY extname
-                """
-            )
-            objects = (
-                [{"name": row.cells["extname"], "version": row.cells["extversion"], "relocatable": row.cells["extrelocatable"]} for row in rows]
-                if rows
-                else []
-            )
-
+        
+        # Parse the table name
+        if "." in table:
+            schema, table_name = table.split(".", 1)
         else:
-            return format_error_response(f"Unsupported object type: {object_type}")
-
-        return format_text_response(objects)
-    except Exception as e:
-        logger.error(f"Error listing objects: {e}")
-        return format_error_response(str(e))
-
-
-@mcp.tool(
-    description="Show detailed information about a database object",
-    annotations=ToolAnnotations(
-        title="Get Object Details",
-        readOnlyHint=True,
-    ),
-)
-async def get_object_details(
-    schema_name: str = Field(description="Schema name"),
-    object_name: str = Field(description="Object name"),
-    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
-) -> ResponseType:
-    """Get detailed information about a database object."""
-    try:
-        sql_driver = await get_sql_driver()
-
-        if object_type in ("table", "view"):
-            # Get columns
-            col_rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT column_name, data_type, is_nullable, column_default
-                FROM information_schema.columns
-                WHERE table_schema = {} AND table_name = {}
-                ORDER BY ordinal_position
-                """,
-                [schema_name, object_name],
-            )
-            columns = (
-                [
-                    {
-                        "column": r.cells["column_name"],
-                        "data_type": r.cells["data_type"],
-                        "is_nullable": r.cells["is_nullable"],
-                        "default": r.cells["column_default"],
-                    }
-                    for r in col_rows
-                ]
-                if col_rows
-                else []
-            )
-
-            # Get constraints
-            con_rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT tc.constraint_name, tc.constraint_type, kcu.column_name
-                FROM information_schema.table_constraints AS tc
-                LEFT JOIN information_schema.key_column_usage AS kcu
-                  ON tc.constraint_name = kcu.constraint_name
-                 AND tc.table_schema = kcu.table_schema
-                WHERE tc.table_schema = {} AND tc.table_name = {}
-                """,
-                [schema_name, object_name],
-            )
-
-            constraints = {}
-            if con_rows:
-                for row in con_rows:
-                    cname = row.cells["constraint_name"]
-                    ctype = row.cells["constraint_type"]
-                    col = row.cells["column_name"]
-
-                    if cname not in constraints:
-                        constraints[cname] = {"type": ctype, "columns": []}
-                    if col:
-                        constraints[cname]["columns"].append(col)
-
-            constraints_list = [{"name": name, **data} for name, data in constraints.items()]
-
-            # Get indexes
-            idx_rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT indexname, indexdef
-                FROM pg_indexes
-                WHERE schemaname = {} AND tablename = {}
-                """,
-                [schema_name, object_name],
-            )
-
-            indexes = [{"name": r.cells["indexname"], "definition": r.cells["indexdef"]} for r in idx_rows] if idx_rows else []
-
-            result = {
-                "basic": {"schema": schema_name, "name": object_name, "type": object_type},
-                "columns": columns,
-                "constraints": constraints_list,
-                "indexes": indexes,
-            }
-
-        elif object_type == "sequence":
-            rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT sequence_schema, sequence_name, data_type, start_value, increment
-                FROM information_schema.sequences
-                WHERE sequence_schema = {} AND sequence_name = {}
-                """,
-                [schema_name, object_name],
-            )
-
-            if rows and rows[0]:
-                row = rows[0]
-                result = {
-                    "schema": row.cells["sequence_schema"],
-                    "name": row.cells["sequence_name"],
-                    "data_type": row.cells["data_type"],
-                    "start_value": row.cells["start_value"],
-                    "increment": row.cells["increment"],
-                }
-            else:
-                result = {}
-
-        elif object_type == "extension":
-            rows = await SafeSqlDriver.execute_param_query(
-                sql_driver,
-                """
-                SELECT extname, extversion, extrelocatable
-                FROM pg_extension
-                WHERE extname = {}
-                """,
-                [object_name],
-            )
-
-            if rows and rows[0]:
-                row = rows[0]
-                result = {"name": row.cells["extname"], "version": row.cells["extversion"], "relocatable": row.cells["extrelocatable"]}
-            else:
-                result = {}
-
-        else:
-            return format_error_response(f"Unsupported object type: {object_type}")
-
+            schema = "public"
+            table_name = table
+        
+        rows = await sql_driver.execute_query(
+            """
+            SELECT
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.ordinal_position
+            FROM information_schema.columns c
+            WHERE c.table_schema = %s AND c.table_name = %s
+            ORDER BY c.ordinal_position
+            """,
+            [schema, table_name],
+        )
+        
+        # Build the schema structure
+        columns = []
+        if rows:
+            for row in rows:
+                columns.append({
+                    "name": row.cells["column_name"],
+                    "type": row.cells["data_type"],
+                    "nullable": row.cells["is_nullable"]
+                })
+        
+        if not columns:
+            return format_error_response(f"Table '{table}' not found in schema '{schema}'")
+        
+        result = {
+            "schema": schema,
+            "table": table_name,
+            "columns": columns
+        }
+        
         return format_text_response(result)
     except Exception as e:
-        logger.error(f"Error getting object details: {e}")
+        logger.error(f"Error getting table schema: {e}")
         return format_error_response(str(e))
-
 
 @mcp.tool(
     description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.",
