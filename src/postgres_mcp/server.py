@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import logging
 import os
+import secrets
 import signal
 import sys
 from enum import Enum
@@ -12,13 +13,20 @@ from typing import Literal
 from typing import Union
 
 import mcp.types as types
+import uvicorn
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from pydantic import Field
 from pydantic import validate_call
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp
+from starlette.types import Receive
+from starlette.types import Scope
+from starlette.types import Send
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
+
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
@@ -60,6 +68,38 @@ class AccessMode(str, Enum):
 db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
+
+
+class BearerAuthMiddleware:
+    """ASGI middleware that requires a static bearer token on all HTTP requests."""
+
+    def __init__(self, app: ASGIApp, token: str):
+        self.app = app
+        self.expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        auth_header = next((value for name, value in scope.get("headers", []) if name == b"authorization"), None)
+        if auth_header is None or not secrets.compare_digest(auth_header, self.expected):
+            response = JSONResponse(
+                {"error": "unauthorized", "detail": "Missing or invalid bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+async def run_http_app(app: ASGIApp, host: str, port: int) -> None:
+    """Serve an ASGI app with uvicorn, mirroring FastMCP's internal server setup."""
+    config = uvicorn.Config(app, host=host, port=port, log_level=mcp.settings.log_level.lower())
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
@@ -450,6 +490,12 @@ async def main():
         default=8000,
         help="Port for streamable HTTP server (default: 8000)",
     )
+    parser.add_argument(
+        "--bearer-token",
+        type=str,
+        default=None,
+        help="Require this bearer token on HTTP transports (sse, streamable-http). Can also be set via the MCP_BEARER_TOKEN environment variable.",
+    )
 
     args = parser.parse_args()
 
@@ -510,17 +556,32 @@ async def main():
         logger.warning("Signal handling not supported on Windows")
         pass
 
+    # Bearer token for HTTP transports (env var takes precedence over CLI argument)
+    bearer_token = os.environ.get("MCP_BEARER_TOKEN", args.bearer_token)
+
     # Run the server with the selected transport (always async)
     if args.transport == "stdio":
+        if bearer_token:
+            logger.warning("Bearer token authentication is not applicable to the stdio transport and will be ignored")
         await mcp.run_stdio_async()
     elif args.transport == "sse":
         mcp.settings.host = args.sse_host
         mcp.settings.port = args.sse_port
-        await mcp.run_sse_async()
+        if bearer_token:
+            logger.info("Bearer token authentication enabled for SSE transport")
+            app = BearerAuthMiddleware(mcp.sse_app(), bearer_token)
+            await run_http_app(app, args.sse_host, args.sse_port)
+        else:
+            await mcp.run_sse_async()
     elif args.transport == "streamable-http":
         mcp.settings.host = args.streamable_http_host
         mcp.settings.port = args.streamable_http_port
-        await mcp.run_streamable_http_async()
+        if bearer_token:
+            logger.info("Bearer token authentication enabled for streamable HTTP transport")
+            app = BearerAuthMiddleware(mcp.streamable_http_app(), bearer_token)
+            await run_http_app(app, args.streamable_http_host, args.streamable_http_port)
+        else:
+            await mcp.run_streamable_http_async()
 
 
 async def shutdown(sig=None):

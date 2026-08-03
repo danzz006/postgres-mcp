@@ -276,6 +276,36 @@ For Windsurf, the format in `mcp_config.json` is slightly different:
 }
 ```
 
+### Bearer Token Authentication
+
+When exposing the server over an HTTP transport (`sse` or `streamable-http`), you can require a bearer token on every request using the `--bearer-token` option or the `MCP_BEARER_TOKEN` environment variable (the environment variable takes precedence):
+
+```bash
+docker run -p 8000:8000 \
+  -e DATABASE_URI=postgresql://username:password@localhost:5432/dbname \
+  -e MCP_BEARER_TOKEN=your-secret-token \
+  crystaldba/postgres-mcp --access-mode=unrestricted --transport=sse
+```
+
+Requests without a valid `Authorization: Bearer your-secret-token` header receive a `401 Unauthorized` response.
+Configure your MCP client to send the header, for example:
+
+```json
+{
+    "mcpServers": {
+        "postgres": {
+            "type": "sse",
+            "url": "http://localhost:8000/sse",
+            "headers": {
+                "Authorization": "Bearer your-secret-token"
+            }
+        }
+    }
+}
+```
+
+The token is ignored for the `stdio` transport, which does not use HTTP.
+
 ## Postgres Extension Installation (Optional)
 
 To enable index tuning and comprehensive performance analysis you need to load the `pg_stat_statements` and `hypopg` extensions on your database.
