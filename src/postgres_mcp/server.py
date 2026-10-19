@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import secrets
 import signal
 import sys
@@ -10,6 +11,7 @@ from enum import Enum
 from typing import Any
 from typing import List
 from typing import Literal
+from typing import Optional
 from typing import Union
 
 import mcp.types as types
@@ -135,6 +137,7 @@ async def list_tables() -> ResponseType:
     """List all available tables in the database."""
     try:
         sql_driver = await get_sql_driver()
+        # information_schema.tables leaves out materialized views, so they are added from pg_class.
         rows = await sql_driver.execute_query(
             """
             SELECT
@@ -142,7 +145,13 @@ async def list_tables() -> ResponseType:
                 t.table_name
             FROM information_schema.tables t
             WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY t.table_schema, t.table_name
+            UNION ALL
+            SELECT n.nspname, c.relname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'm'
+              AND (pg_has_role(c.relowner, 'USAGE') OR has_table_privilege(c.oid, 'SELECT'))
+            ORDER BY 1, 2
             """
         )
         
@@ -161,8 +170,29 @@ async def list_tables() -> ResponseType:
         return format_error_response(str(e))
 
 
+# A one-column CHECK constraint that lists the allowed values, as pg_get_constraintdef() prints it:
+# CHECK ((answer = ANY (ARRAY['comply'::text, 'na'::text]))), CHECK ((status = 'approved'::text)), or for
+# varchar columns CHECK (((status)::text = ANY ((ARRAY['a'::character varying])::text[]))).
+_CHECK_VALUES = re.compile(
+    r"CHECK \(+\"?\w+\"?\)?(?:::[\w ]+)? = "
+    r"(?:ANY \(+ARRAY\[(?P<values>[^\]]+)\]\)*(?:::[\w ]+\[\])?\)+|(?P<value>'(?:[^']|'')*'::[\w ]+)\)+)"
+)
+_CHECK_LITERAL = re.compile(r"'((?:[^']|'')*)'::[\w ]+")
+_RELATION_KINDS = {"v": "view", "m": "materialized view", "f": "foreign table"}
+
+
+def check_allowed_values(definition: str) -> Optional[List[str]]:
+    """The values a CHECK constraint allows when it is a list of string literals for one column, else None."""
+    match = _CHECK_VALUES.fullmatch(definition)
+    if not match:
+        return None
+    values = _CHECK_LITERAL.findall(match.group("values") or match.group("value"))
+    return [value.replace("''", "'") for value in values] or None
+
+
 @mcp.tool(
-    description="Get the schema and column structure of a specific table",
+    description="Get the columns of a table or view (type, nullability, comment, allowed values) with the table's comment, "
+    "primary key, unique keys and foreign keys",
     annotations=ToolAnnotations(
         title="Get Table Schema",
         readOnlyHint=True,
@@ -171,50 +201,127 @@ async def list_tables() -> ResponseType:
 async def get_table_schema(
     table: str = Field(description="Table name (optionally schema-qualified, e.g., 'public.users' or 'users')"),
 ) -> ResponseType:
-    """Get the schema and column structure of a specific table."""
+    """Get the columns, comments and keys of a table, view or materialized view."""
     try:
         sql_driver = await get_sql_driver()
-        
+
         # Parse the table name
         if "." in table:
             schema, table_name = table.split(".", 1)
         else:
             schema = "public"
             table_name = table
-        
+
+        # pg_catalog rather than information_schema: it has the comments and the materialized views.
+        # Columns are shown on the same terms as information_schema.columns shows them.
         rows = await sql_driver.execute_query(
             """
             SELECT
-                c.column_name,
-                c.data_type,
-                c.is_nullable,
-                c.ordinal_position
-            FROM information_schema.columns c
-            WHERE c.table_schema = %s AND c.table_name = %s
-            ORDER BY c.ordinal_position
+                a.attname::text AS column_name,
+                format_type(a.atttypid, a.atttypmod) AS data_type,
+                CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+                col_description(c.oid, a.attnum) AS column_comment,
+                obj_description(c.oid, 'pg_class') AS table_comment,
+                c.relkind::text AS relkind
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+            WHERE n.nspname = %s AND c.relname = %s
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND (pg_has_role(c.relowner, 'USAGE')
+                   OR has_column_privilege(c.oid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'))
+            ORDER BY a.attnum
             """,
             [schema, table_name],
         )
-        
+
         # Build the schema structure
         columns = []
         if rows:
             for row in rows:
-                columns.append({
+                column = {
                     "name": row.cells["column_name"],
                     "type": row.cells["data_type"],
                     "nullable": row.cells["is_nullable"]
-                })
-        
+                }
+                if row.cells["column_comment"]:
+                    column["comment"] = row.cells["column_comment"]
+                columns.append(column)
+
         if not columns:
             return format_error_response(f"Table '{table}' not found in schema '{schema}'")
-        
+
         result = {
             "schema": schema,
             "table": table_name,
-            "columns": columns
         }
-        
+        if rows[0].cells["relkind"] in _RELATION_KINDS:
+            result["kind"] = _RELATION_KINDS[rows[0].cells["relkind"]]
+        if rows[0].cells["table_comment"]:
+            result["comment"] = rows[0].cells["table_comment"]
+        result["columns"] = columns
+
+        # Keys: unique indexes on plain columns (primary keys included, so materialized views get
+        # theirs too), then foreign keys and CHECK constraints.
+        key_rows = await sql_driver.execute_query(
+            """
+            WITH rel AS (
+                SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = %s
+            ), keys AS (
+                SELECT
+                    CASE WHEN i.indisprimary THEN 'p' ELSE 'u' END AS kind,
+                    ARRAY(SELECT a.attname::text FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                          ORDER BY k.ord) AS columns,
+                    NULL AS ref_table,
+                    NULL::text[] AS ref_columns,
+                    NULL AS definition
+                FROM pg_index i
+                WHERE i.indrelid = (SELECT oid FROM rel) AND i.indisunique
+                  AND i.indpred IS NULL AND i.indexprs IS NULL
+                UNION ALL
+                SELECT
+                    con.contype::text,
+                    ARRAY(SELECT a.attname::text FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+                          JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+                          ORDER BY k.ord),
+                    CASE WHEN con.contype = 'f' THEN con.confrelid::regclass::text END,
+                    ARRAY(SELECT a.attname::text FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+                          JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+                          ORDER BY k.ord),
+                    pg_get_constraintdef(con.oid)
+                FROM pg_constraint con
+                WHERE con.conrelid = (SELECT oid FROM rel) AND con.contype IN ('f', 'c')
+            )
+            SELECT * FROM keys ORDER BY array_position(ARRAY['p', 'u', 'f', 'c'], kind), columns
+            """,
+            [schema, table_name],
+        )
+
+        columns_by_name = {column["name"]: column for column in columns}
+        checks = []
+        for row in key_rows or []:
+            kind = row.cells["kind"]
+            key_columns = row.cells["columns"]
+            if kind == "p":
+                result["primary_key"] = key_columns
+            elif kind == "u":
+                result.setdefault("unique", []).append(key_columns)
+            elif kind == "f":
+                result.setdefault("foreign_keys", []).append({
+                    "columns": key_columns,
+                    "references": f"{row.cells['ref_table']}({', '.join(row.cells['ref_columns'])})",
+                })
+            else:
+                values = check_allowed_values(row.cells["definition"]) if len(key_columns) == 1 else None
+                if values and key_columns[0] in columns_by_name:
+                    columns_by_name[key_columns[0]]["allowed_values"] = values
+                else:
+                    checks.append(row.cells["definition"])
+        if checks:
+            result["checks"] = checks
+
         return format_text_response(result)
     except Exception as e:
         logger.error(f"Error getting table schema: {e}")
